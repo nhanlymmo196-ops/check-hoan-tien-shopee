@@ -33,33 +33,58 @@ REQUIRED_COLS = ["Tên khách", "Ngày đặt", "Mã đơn", "Tổng HH thực t
 # =============================================================================
 # 2. XỬ LÝ KẾT NỐI GOOGLE SHEETS & CSV
 # =============================================================================
-def get_service_account_email():
-    """Đọc email của Service Account từ file credentials.json để tiện cấp quyền chia sẻ."""
+def get_credentials_dict():
+    """
+    Lấy thông tin xác thực Service Account:
+    1. Ưu tiên lấy từ st.secrets["google_json"] khi chạy trên Streamlit Cloud / Hosting.
+    2. Dự phòng đọc từ file credentials.json cục bộ nếu có.
+    """
+    # 1. Kiểm tra từ Streamlit Secrets
+    try:
+        if "google_json" in st.secrets:
+            secret_data = st.secrets["google_json"]
+            if isinstance(secret_data, str):
+                return json.loads(secret_data)
+            elif isinstance(secret_data, dict):
+                return secret_data
+    except Exception:
+        pass
+
+    # 2. Dự phòng đọc từ file credentials.json nếu tồn tại
     if os.path.exists(CREDENTIALS_FILE):
         try:
             with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("client_email", "")
+                return json.load(f)
         except Exception:
-            return ""
+            return None
+
+    return None
+
+def get_service_account_email():
+    """Đọc email của Service Account từ st.secrets hoặc file credentials.json."""
+    creds = get_credentials_dict()
+    if creds and isinstance(creds, dict):
+        return creds.get("client_email", "")
     return ""
 
 def get_gsheet_worksheet(sheet_identifier=DEFAULT_SHEET_NAME):
     """
-    Kết nối tới Google Sheets qua Service Account.
+    Kết nối tới Google Sheets qua Service Account bằng dictionary (st.secrets["google_json"]).
     Hỗ trợ mở bằng Tên Sheet, Spreadsheet ID hoặc Link URL.
     """
     if not GSPREAD_AVAILABLE:
         return None, "Thư viện `gspread` chưa được cài đặt."
     
-    if not os.path.exists(CREDENTIALS_FILE):
-        return None, f"Chưa tìm thấy file `{CREDENTIALS_FILE}` trong thư mục ứng dụng."
+    creds_dict = get_credentials_dict()
+    if not creds_dict:
+        return None, "Chưa tìm thấy cấu hình xác thực (st.secrets['google_json'] hoặc file credentials.json)."
     
     try:
-        gc = gspread.service_account(filename=CREDENTIALS_FILE)
+        # Xác thực Service Account từ Dictionary JSON
+        gc = gspread.service_account_from_dict(creds_dict)
         
         # Kiểm tra nếu là URL
-        if sheet_identifier.startswith("https://"):
+        if str(sheet_identifier).startswith("https://"):
             spreadsheet = gc.open_by_url(sheet_identifier)
         else:
             try:
@@ -513,10 +538,17 @@ def main():
                 
                 sa_email = get_service_account_email()
                 if sa_email:
-                    st.success("✅ Đã tìm thấy `credentials.json`")
+                    try:
+                        has_secrets = "google_json" in st.secrets
+                    except Exception:
+                        has_secrets = False
+                    if has_secrets:
+                        st.success("✅ Đã kết nối qua `st.secrets['google_json']`")
+                    else:
+                        st.success("✅ Đã tìm thấy `credentials.json` cục bộ")
                     st.text_area("Email Service Account (chia sẻ quyền Editor cho email này):", value=sa_email, height=70)
                 else:
-                    st.warning("⚠️ Chưa có file `credentials.json` trong thư mục `D:\\CheckShopee`.")
+                    st.warning("⚠️ Chưa cấu hình `st.secrets['google_json']` hoặc file `credentials.json`.")
                     st.caption("Ứng dụng đang tự động chạy ở chế độ **CSV cục bộ**.")
 
             if st.button("🚪 Đăng xuất", use_container_width=True):
