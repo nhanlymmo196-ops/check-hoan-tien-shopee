@@ -3,6 +3,7 @@
 Hệ thống Quản lý & Tra cứu Hoàn tiền Hoa hồng Shopee
 Giao diện UI/UX Hiện đại - Tone màu Cam Shopee (#ee4d2d)
 Hỗ trợ lưu trữ trực tiếp vào Google Sheets theo thời gian thực (Real-time)
+Tích hợp Bảng Mapping_Data, Import CSV Shopee & Đồng bộ Tên Khách Hàng
 Cơ chế tự động dự phòng (Fallback) file CSV cục bộ
 """
 
@@ -11,6 +12,7 @@ import pandas as pd
 import datetime
 import os
 import json
+import io
 
 # Thử import gspread để kết nối Google Sheets
 try:
@@ -23,15 +25,18 @@ except ImportError:
 # 1. CẤU HÌNH HỆ THỐNG
 # =============================================================================
 CSV_FILE = "shopee_cashback.csv"
+MAPPING_CSV_FILE = "mapping_data.csv"
 CREDENTIALS_FILE = "credentials.json"
 DEFAULT_SHEET_NAME = "Shopee_Cashback"
+MAPPING_SHEET_NAME = "Mapping_Data"
 DEFAULT_ADMIN_PASS = "Kunhan1996@"
-STATUS_OPTIONS = ["Chờ Shopee duyệt", "Đã bank", "Không hợp lệ"]
+STATUS_OPTIONS = ["Chờ Shopee duyệt", "Chờ Bank", "Đã bank", "Không hợp lệ"]
 REQUIRED_COLS = ["Tên khách", "Ngày đặt", "Mã đơn", "Tổng HH thực tế", "Trạng thái"]
+MAPPING_COLS = ["Mã Zalo (Sub_id2)", "Tên Khách Hàng"]
 
 
 # =============================================================================
-# 2. XỬ LÝ KẾT NỐI GOOGLE SHEETS & CSV
+# 2. XỬ LÝ KẾT NỐI GOOGLE SHEETS & SECRETS
 # =============================================================================
 def get_credentials_dict():
     """
@@ -39,7 +44,6 @@ def get_credentials_dict():
     1. Ưu tiên lấy từ st.secrets["google_json"] khi chạy trên Streamlit Cloud / Hosting.
     2. Dự phòng đọc từ file credentials.json cục bộ nếu có.
     """
-    # 1. Kiểm tra từ Streamlit Secrets
     try:
         if "google_json" in st.secrets:
             secret_data = st.secrets["google_json"]
@@ -50,7 +54,6 @@ def get_credentials_dict():
     except Exception:
         pass
 
-    # 2. Dự phòng đọc từ file credentials.json nếu tồn tại
     if os.path.exists(CREDENTIALS_FILE):
         try:
             with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
@@ -67,11 +70,8 @@ def get_service_account_email():
         return creds.get("client_email", "")
     return ""
 
-def get_gsheet_worksheet(sheet_identifier=DEFAULT_SHEET_NAME):
-    """
-    Kết nối tới Google Sheets qua Service Account bằng dictionary (st.secrets["google_json"]).
-    Hỗ trợ mở bằng Tên Sheet, Spreadsheet ID hoặc Link URL.
-    """
+def get_gsheet_spreadsheet(sheet_identifier=DEFAULT_SHEET_NAME):
+    """Mở Spreadsheet Google Sheets."""
     if not GSPREAD_AVAILABLE:
         return None, "Thư viện `gspread` chưa được cài đặt."
     
@@ -80,10 +80,7 @@ def get_gsheet_worksheet(sheet_identifier=DEFAULT_SHEET_NAME):
         return None, "Chưa tìm thấy cấu hình xác thực (st.secrets['google_json'] hoặc file credentials.json)."
     
     try:
-        # Xác thực Service Account từ Dictionary JSON
         gc = gspread.service_account_from_dict(creds_dict)
-        
-        # Kiểm tra nếu là URL
         if str(sheet_identifier).startswith("https://"):
             spreadsheet = gc.open_by_url(sheet_identifier)
         else:
@@ -91,14 +88,43 @@ def get_gsheet_worksheet(sheet_identifier=DEFAULT_SHEET_NAME):
                 spreadsheet = gc.open(sheet_identifier)
             except Exception:
                 spreadsheet = gc.open_by_key(sheet_identifier)
-                
-        worksheet = spreadsheet.sheet1
-        return worksheet, None
+        return spreadsheet, None
     except Exception as e:
         return None, str(e)
 
+def get_gsheet_worksheet(sheet_identifier=DEFAULT_SHEET_NAME, worksheet_name=None):
+    """
+    Lấy Worksheet từ Google Sheets.
+    Nếu worksheet_name=None -> Lấy sheet1 (Shopee_Cashback).
+    Nếu worksheet_name được chỉ định (như Mapping_Data) -> Lấy sheet đó, nếu chưa có thì tự động tạo mới.
+    """
+    sh, err = get_gsheet_spreadsheet(sheet_identifier)
+    if sh is None:
+        return None, err
+    
+    try:
+        if not worksheet_name:
+            return sh.sheet1, None
+        
+        # Tìm worksheet theo tên
+        titles = [ws.title for ws in sh.worksheets()]
+        if worksheet_name in titles:
+            return sh.worksheet(worksheet_name), None
+        else:
+            # Tự động tạo worksheet mới nếu chưa tồn tại
+            cols_init = MAPPING_COLS if worksheet_name == MAPPING_SHEET_NAME else REQUIRED_COLS
+            new_ws = sh.add_worksheet(title=worksheet_name, rows=1000, cols=10)
+            new_ws.append_row(cols_init)
+            return new_ws, None
+    except Exception as e:
+        return None, str(e)
+
+
+# =============================================================================
+# 3. QUẢN LÝ DỮ LIỆU ĐƠN HÀNG (SHOPEE_CASHBACK)
+# =============================================================================
 def normalize_df(df):
-    """Chuẩn hóa cấu trúc DataFrame đồng nhất."""
+    """Chuẩn hóa cấu trúc DataFrame đơn hàng đồng nhất."""
     df_clean = df.copy()
     for col in REQUIRED_COLS:
         if col not in df_clean.columns:
@@ -112,7 +138,7 @@ def normalize_df(df):
     return df_clean[REQUIRED_COLS]
 
 def load_local_csv():
-    """Đọc dữ liệu từ file CSV cục bộ."""
+    """Đọc dữ liệu đơn hàng từ file CSV cục bộ."""
     if not os.path.exists(CSV_FILE):
         df = pd.DataFrame(columns=REQUIRED_COLS)
         save_local_csv(df)
@@ -128,7 +154,7 @@ def load_local_csv():
         return pd.DataFrame(columns=REQUIRED_COLS)
 
 def save_local_csv(df):
-    """Lưu backup ra file CSV cục bộ."""
+    """Lưu backup đơn hàng ra file CSV cục bộ."""
     try:
         df_save = df.copy()
         df_save["Mã đơn"] = df_save["Mã đơn"].astype(str)
@@ -138,13 +164,12 @@ def save_local_csv(df):
 
 def load_data(sheet_target=DEFAULT_SHEET_NAME):
     """
-    Đọc dữ liệu: Ưu tiên đọc trực tiếp từ Google Sheets.
-    Nếu chưa cấu hình hoặc mất mạng -> Fallback về file CSV cục bộ.
+    Đọc dữ liệu đơn hàng: Ưu tiên từ Google Sheets.
+    Fallback về file CSV cục bộ nếu chưa cấu hình hoặc mất mạng.
     """
     ws, err = get_gsheet_worksheet(sheet_target)
     if ws is not None:
         try:
-            # get_all_values() trả về mảng chuỗi nguyên bản, bảo toàn số 0 đầu của Mã đơn
             records = ws.get_all_values()
             if len(records) > 0:
                 headers = records[0]
@@ -152,27 +177,20 @@ def load_data(sheet_target=DEFAULT_SHEET_NAME):
                 df = pd.DataFrame(rows, columns=headers)
                 df = normalize_df(df)
             else:
-                # Nếu trang tính trống, tự động ghi dòng tiêu đề
                 ws.append_row(REQUIRED_COLS)
                 df = pd.DataFrame(columns=REQUIRED_COLS)
                 
-            # Lưu backup cục bộ
             save_local_csv(df)
             return df, "gsheets", None
         except Exception as e:
             fallback_df = load_local_csv()
             return fallback_df, "csv_fallback", f"Lỗi đọc Google Sheets: {e}"
             
-    # Chưa kết nối Google Sheets -> Dùng CSV cục bộ
     fallback_df = load_local_csv()
     return fallback_df, "csv", err
 
 def add_order_to_storage(new_row_dict, sheet_target=DEFAULT_SHEET_NAME):
-    """
-    Thêm 1 đơn hàng mới:
-    Nếu có Google Sheets -> gọi append_row cực nhanh.
-    Đồng thời cập nhật file CSV cục bộ.
-    """
+    """Thêm 1 đơn hàng mới vào Google Sheets & CSV."""
     cust_name = new_row_dict.get("Tên khách", "")
     order_date = new_row_dict.get("Ngày đặt", "")
     order_code = str(new_row_dict.get("Mã đơn", "")).strip()
@@ -184,7 +202,6 @@ def add_order_to_storage(new_row_dict, sheet_target=DEFAULT_SHEET_NAME):
     
     if ws is not None:
         try:
-            # Nếu mã đơn có số 0 ở đầu, thêm dấu ' để Google Sheets hiểu là dạng Text
             code_formatted = f"'{order_code}" if order_code.startswith("0") else order_code
             row_data = [cust_name, order_date, code_formatted, commission, status]
             ws.append_row(row_data, value_input_option="USER_ENTERED")
@@ -192,7 +209,6 @@ def add_order_to_storage(new_row_dict, sheet_target=DEFAULT_SHEET_NAME):
         except Exception as e:
             st.error(f"Lỗi ghi vào Google Sheets: {e}")
             
-    # Luôn đồng bộ vào file CSV cục bộ
     current_df = load_local_csv()
     new_df = pd.DataFrame([{
         "Tên khách": cust_name,
@@ -206,11 +222,50 @@ def add_order_to_storage(new_row_dict, sheet_target=DEFAULT_SHEET_NAME):
     
     return saved_to_gsheet
 
+def batch_add_orders_to_storage(orders_list, sheet_target=DEFAULT_SHEET_NAME):
+    """
+    Thêm danh sách nhiều đơn hàng cùng lúc (Dùng khi Import CSV).
+    Sử dụng append_rows để tối ưu tốc độ.
+    """
+    if not orders_list:
+        return True, 0
+    
+    ws, err = get_gsheet_worksheet(sheet_target)
+    rows_to_append = []
+    for item in orders_list:
+        code_str = str(item.get("Mã đơn", "")).strip()
+        code_fmt = f"'{code_str}" if code_str.startswith("0") else code_str
+        rows_to_append.append([
+            str(item.get("Tên khách", "")).strip(),
+            str(item.get("Ngày đặt", "")).strip(),
+            code_fmt,
+            int(item.get("Tổng HH thực tế", 0)),
+            str(item.get("Trạng thái", "Chờ Shopee duyệt")).strip()
+        ])
+    
+    # 1. Ghi lên Google Sheets
+    if ws is not None:
+        try:
+            ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+        except Exception as e:
+            st.warning(f"Lưu ý: Không thể ghi trực tiếp lên Google Sheets ({e}). Đã lưu dự phòng vào CSV.")
+            
+    # 2. Đồng bộ vào CSV cục bộ
+    current_df = load_local_csv()
+    new_records_df = pd.DataFrame([{
+        "Tên khách": str(item.get("Tên khách", "")).strip(),
+        "Ngày đặt": str(item.get("Ngày đặt", "")).strip(),
+        "Mã đơn": str(item.get("Mã đơn", "")).strip(),
+        "Tổng HH thực tế": int(item.get("Tổng HH thực tế", 0)),
+        "Trạng thái": str(item.get("Trạng thái", "Chờ Shopee duyệt")).strip()
+    } for item in orders_list])
+    
+    updated_df = pd.concat([current_df, new_records_df], ignore_index=True)
+    save_local_csv(updated_df)
+    return True, len(orders_list)
+
 def save_all_to_storage(df, sheet_target=DEFAULT_SHEET_NAME):
-    """
-    Ghi đè toàn bộ dữ liệu (dùng cho Tab 2 Data Editor):
-    Cập nhật đồng thời lên Google Sheets và file CSV.
-    """
+    """Ghi đè toàn bộ dữ liệu đơn hàng (dùng cho Tab 2 Data Editor)."""
     df_clean = normalize_df(df)
     save_local_csv(df_clean)
     
@@ -235,14 +290,302 @@ def save_all_to_storage(df, sheet_target=DEFAULT_SHEET_NAME):
             return False, str(e)
     return False, err
 
+
+# =============================================================================
+# 4. QUẢN LÝ BẢNG MAPPING (MAPPING_DATA) & ĐỒNG BỘ TÊN KHÁCH HÀNG
+# =============================================================================
+def normalize_mapping_df(df):
+    """Chuẩn hóa cấu trúc DataFrame Mapping Khách Hàng."""
+    df_clean = df.copy()
+    for col in MAPPING_COLS:
+        if col not in df_clean.columns:
+            df_clean[col] = ""
+    df_clean["Mã Zalo (Sub_id2)"] = df_clean["Mã Zalo (Sub_id2)"].fillna("").astype(str).str.strip()
+    df_clean["Tên Khách Hàng"] = df_clean["Tên Khách Hàng"].fillna("").astype(str).str.strip()
+    # Loại bỏ dòng hoàn toàn rỗng
+    df_clean = df_clean[df_clean["Mã Zalo (Sub_id2)"] != ""]
+    return df_clean[MAPPING_COLS].drop_duplicates(subset=["Mã Zalo (Sub_id2)"], keep="last")
+
+def load_local_mapping_csv():
+    """Đọc dữ liệu mapping từ file CSV cục bộ."""
+    if not os.path.exists(MAPPING_CSV_FILE):
+        df = pd.DataFrame(columns=MAPPING_COLS)
+        save_local_mapping_csv(df)
+        return df
+    try:
+        df = pd.read_csv(MAPPING_CSV_FILE, dtype={"Mã Zalo (Sub_id2)": str, "Tên Khách Hàng": str}, encoding="utf-8-sig")
+        return normalize_mapping_df(df)
+    except Exception:
+        return pd.DataFrame(columns=MAPPING_COLS)
+
+def save_local_mapping_csv(df_mapping):
+    """Lưu backup mapping ra file CSV cục bộ."""
+    try:
+        df_save = df_mapping.copy()
+        df_save["Mã Zalo (Sub_id2)"] = df_save["Mã Zalo (Sub_id2)"].astype(str)
+        df_save.to_csv(MAPPING_CSV_FILE, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+def load_mapping_data(sheet_target=DEFAULT_SHEET_NAME):
+    """
+    Đọc dữ liệu bảng Mapping: Ưu tiên đọc từ Google Sheets (Sheet: Mapping_Data).
+    Fallback về file mapping_data.csv nếu offline.
+    """
+    ws, err = get_gsheet_worksheet(sheet_target, worksheet_name=MAPPING_SHEET_NAME)
+    if ws is not None:
+        try:
+            records = ws.get_all_values()
+            if len(records) > 0:
+                headers = records[0]
+                rows = records[1:] if len(records) > 1 else []
+                df = pd.DataFrame(rows, columns=headers)
+                df = normalize_mapping_df(df)
+            else:
+                ws.append_row(MAPPING_COLS)
+                df = pd.DataFrame(columns=MAPPING_COLS)
+                
+            save_local_mapping_csv(df)
+            return df, "gsheets", None
+        except Exception as e:
+            fallback_df = load_local_mapping_csv()
+            return fallback_df, "csv_fallback", f"Lỗi đọc Mapping_Data: {e}"
+            
+    fallback_df = load_local_mapping_csv()
+    return fallback_df, "csv", err
+
+def save_mapping_data(df_mapping, sheet_target=DEFAULT_SHEET_NAME):
+    """Lưu toàn bộ bảng Mapping_Data lên Google Sheets & CSV."""
+    df_clean = normalize_mapping_df(df_mapping)
+    save_local_mapping_csv(df_clean)
+    
+    ws, err = get_gsheet_worksheet(sheet_target, worksheet_name=MAPPING_SHEET_NAME)
+    if ws is not None:
+        try:
+            rows = [MAPPING_COLS]
+            for _, r in df_clean.iterrows():
+                zalo_val = str(r["Mã Zalo (Sub_id2)"]).strip()
+                zalo_fmt = f"'{zalo_val}" if zalo_val.startswith("0") else zalo_val
+                rows.append([zalo_fmt, str(r["Tên Khách Hàng"]).strip()])
+            ws.clear()
+            ws.update(rows, value_input_option="USER_ENTERED")
+            return True, None
+        except Exception as e:
+            return False, str(e)
+    return False, err
+
+def batch_add_mapping_records(new_mappings_dict, sheet_target=DEFAULT_SHEET_NAME):
+    """
+    Thêm danh sách khách hàng mới vào bảng Mapping_Data.
+    new_mappings_dict: {zalo_id: customer_name}
+    """
+    if not new_mappings_dict:
+        return
+    
+    current_mapping, _, _ = load_mapping_data(sheet_target)
+    new_rows = []
+    existing_zalos = set(current_mapping["Mã Zalo (Sub_id2)"].astype(str).str.strip())
+    
+    for zalo, name in new_mappings_dict.items():
+        zalo_str = str(zalo).strip()
+        if zalo_str and (zalo_str not in existing_zalos):
+            new_rows.append({"Mã Zalo (Sub_id2)": zalo_str, "Tên Khách Hàng": str(name).strip()})
+            existing_zalos.add(zalo_str)
+            
+    if new_rows:
+        updated_mapping = pd.concat([current_mapping, pd.DataFrame(new_rows)], ignore_index=True)
+        save_mapping_data(updated_mapping, sheet_target)
+
+def sync_customer_name(old_name, new_name, target_sub2=None, sheet_target=DEFAULT_SHEET_NAME):
+    """
+    TÍNH NĂNG 3: ĐỒNG BỘ TÊN KHÁCH HÀNG TRỰC TIẾP TRÊN WEB.
+    1. Cập nhật tên mới vào bảng Mapping_Data (theo target_sub2 hoặc old_name).
+    2. Tự động quét toàn bộ bảng Shopee_Cashback, tìm mọi dòng mang tên old_name -> đổi thành new_name.
+    3. Lưu đồng bộ cả 2 bảng lên Google Sheets & CSV.
+    """
+    old_name_clean = str(old_name).strip()
+    new_name_clean = str(new_name).strip()
+    
+    if not old_name_clean or not new_name_clean:
+        return False, 0, "Tên không được để trống!"
+        
+    # 1. Cập nhật trong bảng Mapping_Data
+    df_mapping, _, _ = load_mapping_data(sheet_target)
+    if target_sub2:
+        mask_map = df_mapping["Mã Zalo (Sub_id2)"] == str(target_sub2).strip()
+        df_mapping.loc[mask_map, "Tên Khách Hàng"] = new_name_clean
+    else:
+        mask_map = df_mapping["Tên Khách Hàng"] == old_name_clean
+        df_mapping.loc[mask_map, "Tên Khách Hàng"] = new_name_clean
+    save_mapping_data(df_mapping, sheet_target)
+    
+    # 2. Cập nhật hàng loạt trong bảng Shopee_Cashback
+    df_orders, _, _ = load_data(sheet_target)
+    mask_orders = df_orders["Tên khách"] == old_name_clean
+    matched_count = int(mask_orders.sum())
+    
+    if matched_count > 0:
+        df_orders.loc[mask_orders, "Tên khách"] = new_name_clean
+        save_all_to_storage(df_orders, sheet_target)
+        
+    return True, matched_count, None
+
+def auto_sync_names_from_mapping(sheet_target=DEFAULT_SHEET_NAME):
+    """
+    Tự động quét và chuẩn hóa toàn bộ tên khách hàng trong Shopee_Cashback
+    dựa theo bảng Mapping_Data (chuyển các tên không dấu / viết liền sang tên chuẩn có dấu).
+    """
+    import unicodedata
+    def clean_key(s):
+        s = unicodedata.normalize('NFD', str(s))
+        s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+        return s.replace('đ', 'd').replace('Đ', 'D').lower().replace(' ', '').strip()
+        
+    df_mapping, _, _ = load_mapping_data(sheet_target)
+    df_orders, _, _ = load_data(sheet_target)
+    if df_mapping.empty or df_orders.empty:
+        return 0, []
+        
+    clean_map = {}
+    for _, r in df_mapping.iterrows():
+        std_name = str(r["Tên Khách Hàng"]).strip()
+        if std_name:
+            clean_map[clean_key(std_name)] = std_name
+            
+    changes = []
+    updated_orders = 0
+    for idx, row in df_orders.iterrows():
+        cur_name = str(row["Tên khách"]).strip()
+        ck = clean_key(cur_name)
+        if ck in clean_map:
+            std_name = clean_map[ck]
+            if cur_name != std_name:
+                df_orders.at[idx, "Tên khách"] = std_name
+                updated_orders += 1
+                changes.append(f"{cur_name} ➔ {std_name}")
+                
+    if updated_orders > 0:
+        save_all_to_storage(df_orders, sheet_target=sheet_target)
+        
+    return updated_orders, list(set(changes))
+
+
+# =============================================================================
+# 5. BỘ LỌC & XỬ LÝ FILE CSV SHOPEE AFFILIATE (TÍNH NĂNG 2)
+# =============================================================================
+def detect_shopee_csv_columns(df):
+    """Tự động nhận diện linh hoạt các cột trong file CSV Shopee Affiliate."""
+    detected = {
+        "order_id": None,
+        "order_time": None,
+        "complete_time": None,
+        "status": None,
+        "commission": None,
+        "sub1": None,
+        "sub2": None
+    }
+    
+    col_mapping_rules = {
+        "order_id": ["id đơn hàng", "mã đơn hàng", "mã đơn", "order id", "order sn", "mã đơn shopee", "order_id", "order_sn", "mã đặt hàng"],
+        "order_time": ["thời gian đặt hàng", "thời gian tạo đơn", "order time", "purchase time", "thời gian đặt"],
+        "complete_time": ["thời gian hoàn thành đơn hàng", "thời gian hoàn thành đơn", "thời gian hoàn thành", "complete time", "completed time"],
+        "status": ["trạng thái đặt hàng", "trạng thái đơn hàng", "trạng thái đơn", "order status", "trạng thái"],
+        "commission": [
+            "tổng hoa hồng sản phẩm", "hoa hồng ròng tiếp thị liên kết", "tổng hoa hồng đơn hàng",
+            "hoa hồng thực tế", "tổng hh thực tế", "hoa hồng thuần", "tổng hoa hồng",
+            "net commission", "commission amount", "actual commission"
+        ],
+        "sub1": ["sub_id1", "sub id 1", "sub id1", "sub1", "sub_1", "tên tạm", "subid1"],
+        "sub2": ["sub_id2", "sub id 2", "sub id2", "sub2", "sub_2", "mã zalo", "zalo", "subid2"]
+    }
+    
+    for actual_col in df.columns:
+        norm_col = str(actual_col).lower().strip()
+        for field, keywords in col_mapping_rules.items():
+            if detected[field] is None:
+                # Bỏ qua các cột chứa từ khóa gây nhiễu cho commission
+                if field == "commission" and any(bad in norm_col for bad in ["loại", "tỷ lệ", "phí", "đối tác"]):
+                    continue
+                for kw in keywords:
+                    if kw in norm_col:
+                        detected[field] = actual_col
+                        break
+                        
+    return detected
+
+def parse_flexible_date(date_val):
+    """Parse chuỗi ngày tháng sang datetime.date bất kể định dạng."""
+    if pd.isna(date_val) or date_val is None or str(date_val).strip() == "":
+        return None
+    val_str = str(date_val).strip()
+    
+    # Thử parse ngày tháng phổ biến
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+        "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y",
+        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"
+    ]:
+        try:
+            return datetime.datetime.strptime(val_str, fmt).date()
+        except Exception:
+            pass
+            
+    # Thử pandas to_datetime
+    try:
+        dt = pd.to_datetime(val_str, errors="coerce")
+        if pd.notna(dt):
+            return dt.date()
+    except Exception:
+        pass
+        
+    return None
+
+def parse_commission_number(val):
+    """Chuyển chuỗi số tiền hoa hồng sang số nguyên VNĐ an toàn."""
+    if pd.isna(val) or val is None:
+        return 0
+    val_str = str(val).strip()
+    if not val_str:
+        return 0
+    clean = val_str.replace("₫", "").replace("VND", "").replace("VNĐ", "").replace(" ", "").strip()
+    
+    # Có cả chấm và phẩy (vd: 1,234.56 hoặc 1.234,56)
+    if "," in clean and "." in clean:
+        if clean.rfind(".") > clean.rfind(","):
+            clean = clean.replace(",", "")
+        else:
+            clean = clean.replace(".", "").replace(",", ".")
+    elif "." in clean:
+        parts = clean.split(".")
+        if len(parts) > 2:
+            clean = clean.replace(".", "")
+        elif len(parts) == 2:
+            if len(parts[1]) == 3:
+                clean = clean.replace(".", "")
+    elif "," in clean:
+        parts = clean.split(",")
+        if len(parts) > 2:
+            clean = clean.replace(",", "")
+        elif len(parts) == 2:
+            if len(parts[1]) == 3:
+                clean = clean.replace(",", "")
+            else:
+                clean = clean.replace(",", ".")
+                
+    try:
+        return int(round(float(clean)))
+    except Exception:
+        return 0
+
+
+# =============================================================================
+# 6. GIAO DIỆN CHÍNH (STREAMLIT APP)
+# =============================================================================
 def format_vnd(amount):
     """Định dạng tiền tệ VNĐ chuẩn có dấu chấm phân cách hàng nghìn."""
     return f"{amount:,.0f} ₫".replace(",", ".")
 
-
-# =============================================================================
-# 3. HÀM GIAO DIỆN CHÍNH (STREAMLIT)
-# =============================================================================
 def main():
     st.set_page_config(
         page_title="Tra cứu Hoàn tiền Hoa hồng Shopee",
@@ -269,7 +612,6 @@ def main():
             --text-muted: #64748b;
         }
         
-        /* Container tiêu đề căn giữa */
         .shopee-header-box {
             text-align: center;
             padding: 32px 20px 28px;
@@ -310,19 +652,20 @@ def main():
             line-height: 1.5;
         }
         
-        /* Thẻ thống kê Metric Cards bo tròn */
         .metrics-container {
             display: flex;
-            gap: 20px;
-            margin: 20px 0 28px;
+            gap: 16px;
+            margin: 20px 0 24px;
             justify-content: center;
+            flex-wrap: wrap;
         }
         
         .metric-card {
             flex: 1;
+            min-width: 220px;
             background: #ffffff;
             border-radius: 16px;
-            padding: 22px 24px;
+            padding: 20px 22px;
             border: 1px solid #e2e8f0;
             box-shadow: 0 4px 15px rgba(0,0,0,0.04);
             transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -342,39 +685,45 @@ def main():
             border-top: 4px solid #10b981;
             background: linear-gradient(180deg, #f0fdf4 0%, #ffffff 70%);
         }
+
+        .metric-card.info {
+            border-top: 4px solid #3b82f6;
+            background: linear-gradient(180deg, #eff6ff 0%, #ffffff 70%);
+        }
+
+        .metric-card.warning {
+            border-top: 4px solid #ee4d2d;
+            background: linear-gradient(180deg, #fff5f2 0%, #ffffff 70%);
+        }
         
         .metric-title {
-            font-size: 14px;
+            font-size: 13px;
             font-weight: 600;
             color: var(--text-muted);
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
         }
         
         .metric-amount {
-            font-size: 28px;
+            font-size: 26px;
             font-weight: 800;
             line-height: 1.2;
         }
         
-        .metric-card.pending .metric-amount {
-            color: #d97706;
-        }
-        
-        .metric-card.success .metric-amount {
-            color: #059669;
-        }
+        .metric-card.pending .metric-amount { color: #d97706; }
+        .metric-card.success .metric-amount { color: #059669; }
+        .metric-card.info .metric-amount { color: #2563eb; }
+        .metric-card.warning .metric-amount { color: #ee4d2d; }
         
         .metric-count {
-            font-size: 13px;
+            font-size: 12px;
             color: #94a3b8;
             margin-top: 6px;
             font-weight: 500;
         }
 
-        /* Nút chính Shopee */
         .stButton > button {
             background: linear-gradient(135deg, #ee4d2d 0%, #ff5722 100%) !important;
             color: white !important;
@@ -393,7 +742,6 @@ def main():
             background: linear-gradient(135deg, #d73211 0%, #e64a19 100%) !important;
         }
         
-        /* Ô input tìm kiếm */
         div[data-testid="stTextInput"] input {
             border-radius: 12px !important;
             border: 2px solid #e2e8f0 !important;
@@ -407,7 +755,6 @@ def main():
             box-shadow: 0 0 0 3px rgba(238, 77, 45, 0.15) !important;
         }
 
-        /* Hướng dẫn tra cứu */
         .guide-box {
             background: #ffffff;
             border: 1px dashed #cbd5e1;
@@ -443,7 +790,6 @@ def main():
             margin-right: 8px;
         }
 
-        /* Sidebar Badge */
         .sidebar-admin-badge {
             padding: 10px 14px;
             border-radius: 10px;
@@ -482,6 +828,25 @@ def main():
             background: #fff3e0;
             color: #e65100;
             border: 1px solid #ffcc80;
+        }
+        
+        .cust-tag-new {
+            background: #fff7ed;
+            color: #c2410c;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            border: 1px solid #fed7aa;
+        }
+        .cust-tag-old {
+            background: #f0fdf4;
+            color: #15803d;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            border: 1px solid #bbf7d0;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -560,6 +925,7 @@ def main():
 
         # Hiển thị trạng thái nguồn dữ liệu
         df_data, storage_mode, storage_err = load_data(st.session_state["sheet_name"])
+        df_mapping, mapping_mode, mapping_err = load_mapping_data(st.session_state["sheet_name"])
         
         if storage_mode == "gsheets":
             st.markdown("""
@@ -609,9 +975,8 @@ def main():
                     df_data["Mã đơn"].str.contains(search_query, case=False, na=False)
                 )
                 matched_df = df_data[mask].copy()
-                
                 if len(matched_df) > 0:
-                    pending_df = matched_df[matched_df["Trạng thái"] == "Chờ Shopee duyệt"]
+                    pending_df = matched_df[matched_df["Trạng thái"].isin(["Chờ Shopee duyệt", "Chờ Bank"])]
                     banked_df = matched_df[matched_df["Trạng thái"] == "Đã bank"]
                     
                     total_pending = pending_df["Tổng HH thực tế"].sum()
@@ -623,9 +988,9 @@ def main():
                     st.markdown(f"""
                     <div class="metrics-container">
                         <div class="metric-card pending">
-                            <div class="metric-title">⏳ Tổng tiền chờ duyệt</div>
+                            <div class="metric-title">⏳ Tổng tiền chờ duyệt / Chờ bank</div>
                             <div class="metric-amount">{format_vnd(total_pending)}</div>
-                            <div class="metric-count">{count_pending} đơn hàng đang đợi đối soát</div>
+                            <div class="metric-count">{count_pending} đơn hàng đang chờ thanh toán</div>
                         </div>
                         <div class="metric-card success">
                             <div class="metric-title">✅ Tổng tiền đã chuyển khoản</div>
@@ -688,22 +1053,25 @@ def main():
 
     else:
         # =====================================================================
-        # B. GIAO DIỆN ADMIN (QUẢN TRỊ VIÊN) - 2 TABS GIỮ NGUYÊN 100%
+        # B. GIAO DIỆN ADMIN (QUẢN TRỊ VIÊN) - 4 TABS CHUYÊN BIỆT
         # =====================================================================
         st.markdown("""
         <div style="margin-bottom: 24px;">
             <h2 style="color: #ee4d2d; font-weight: 800; margin: 0 0 6px;">👑 Bảng Quản Trị Hệ Thống Shopee Cashback</h2>
-            <p style="color: #64748b; margin: 0; font-size: 14px;">Quản lý và cập nhật đơn hàng hoàn tiền hoa hồng. Dữ liệu đồng bộ trực tiếp với Google Sheets / CSV.</p>
+            <p style="color: #64748b; margin: 0; font-size: 14px;">Quản lý đơn hàng, đối soát file CSV báo cáo Shopee, quản lý khách hàng và bảng Mapping ngầm.</p>
         </div>
         """, unsafe_allow_html=True)
         
-        tab1, tab2 = st.tabs([
-            "⚡ Phần 1: Form Nhập Đơn Mới (Smart Input)",
-            "📊 Phần 2: Cập Nhật Dữ Liệu (Quản lý hàng loạt)"
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "⚡ Phần 1: Nhập Đơn Thủ Công",
+            "📥 Phần 2: Nạp Đơn Hàng Từ CSV (Hàng Ngày)",
+            "💰 Phần 3: Đối Soát Hoa Hồng (Cuối Kỳ)",
+            "📊 Phần 4: Cập Nhật Dữ Liệu Hàng Loạt",
+            "👥 Phần 5: Quản Lý Khách Hàng (Mapping & Đồng Bộ)"
         ])
         
         # ---------------------------------------------------------------------
-        # TAB 1: FORM NHẬP ĐƠN MỚI
+        # TAB 1: FORM NHẬP ĐƠN THỦ CÔNG (GIỮ NGUYÊN)
         # ---------------------------------------------------------------------
         with tab1:
             st.markdown("##### 📝 Thêm Đơn Hàng Mới Tốc Độ Cao")
@@ -798,10 +1166,562 @@ def main():
                         st.rerun()
 
         # ---------------------------------------------------------------------
-        # TAB 2: CẬP NHẬT DỮ LIỆU (QUẢN LÝ HÀNG LOẠT)
+        # TAB 2: PHẦN 2 - NẠP ĐƠN HÀNG TỪ CSV (HÀNG NGÀY)
         # ---------------------------------------------------------------------
         with tab2:
-            st.markdown("##### ✏️ Quản Lý & Chỉnh Sửa Dữ Liệu Hàng Loạt")
+            st.markdown("##### 📥 Phần 2: Nạp Đơn Hàng Mới Từ File CSV Báo Cáo Shopee")
+            st.caption("💡 *Tải lên file CSV báo cáo chuyển đổi Shopee hàng ngày. Tự động gom sản phẩm theo mã đơn, lọc đơn hợp lệ, nhận diện khách cũ từ Mapping_Data hoặc thêm khách mới, và nạp nhanh vào Shopee_Cashback để khách tra cứu.*")
+            
+            st.markdown("###### 🗓️ 1. Thiết Lập Điều Kiện Nạp Đơn:")
+            col_d1, col_d2, col_d3 = st.columns([2, 2, 2])
+            with col_d1:
+                default_start = datetime.date.today() - datetime.timedelta(days=7)
+                daily_start_date = st.date_input("Từ ngày đặt:", value=default_start, format="DD/MM/YYYY", key="daily_start_date")
+            with col_d2:
+                daily_end_date = st.date_input("Đến ngày đặt:", value=datetime.date.today(), format="DD/MM/YYYY", key="daily_end_date")
+            with col_d3:
+                daily_import_status = st.selectbox("Trạng thái ghi nhận:", options=STATUS_OPTIONS, index=0, key="daily_import_status")
+                
+            daily_ignore_date = st.checkbox("Nạp toàn bộ đơn trong file (không lọc theo khoảng ngày ở trên)", value=False, key="daily_ignore_date")
+            
+            st.markdown("###### 📁 2. Tải Lên File Báo Cáo Shopee (.csv):")
+            uploaded_daily_file = st.file_uploader(
+                "Chọn file CSV báo cáo từ Shopee Affiliate:",
+                type=["csv"],
+                help="Chọn file CSV báo cáo chuyển đổi / đơn hàng xuất từ Shopee Affiliate",
+                key="daily_csv_uploader"
+            )
+            
+            if uploaded_daily_file is not None:
+                raw_bytes = uploaded_daily_file.getvalue()
+                df_raw_csv = None
+                for enc in ["utf-8-sig", "utf-8", "cp1258", "latin-1"]:
+                    try:
+                        df_raw_csv = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc, dtype=str)
+                        break
+                    except Exception:
+                        continue
+                        
+                if df_raw_csv is None or df_raw_csv.empty:
+                    st.error("❌ Không thể đọc nội dung file CSV. Vui lòng kiểm tra lại định dạng file!")
+                else:
+                    col_map = detect_shopee_csv_columns(df_raw_csv)
+                    
+                    time_col_detected = None
+                    if col_map["order_time"] and df_raw_csv[col_map["order_time"]].dropna().str.strip().ne("").any():
+                        time_col_detected = col_map["order_time"]
+                        time_col_type_label = "Thời gian đặt hàng"
+                    elif col_map["complete_time"]:
+                        time_col_detected = col_map["complete_time"]
+                        time_col_type_label = "Thời gian hoàn thành"
+                    else:
+                        time_col_detected = col_map["order_time"]
+                        time_col_type_label = "Thời gian đặt hàng"
+                    
+                    missing_cols = []
+                    if not col_map["order_id"]: missing_cols.append("Mã đơn hàng (ID đơn hàng / Order ID)")
+                    if not time_col_detected and not daily_ignore_date: missing_cols.append("Thời gian đặt hàng / hoàn thành")
+                    if not col_map["status"]: missing_cols.append("Trạng thái (Order Status)")
+                    if not col_map["commission"]: missing_cols.append("Hoa hồng thực tế (Commission)")
+                    
+                    if missing_cols:
+                        st.error(f"⚠️ File CSV thiếu các cột bắt buộc: {', '.join(missing_cols)}. Vui lòng kiểm tra lại file xuất từ Shopee!")
+                        st.write("Các cột hiện có trong file CSV của bạn:", list(df_raw_csv.columns))
+                    else:
+                        with st.expander("🔍 Chi tiết nhận diện các cột Shopee:", expanded=False):
+                            st.write(f"- Cột Mã đơn: `{col_map['order_id']}`")
+                            st.write(f"- Cột Thời gian: `{time_col_detected}` ({time_col_type_label})")
+                            st.write(f"- Cột Trạng thái: `{col_map['status']}`")
+                            st.write(f"- Cột Hoa hồng: `{col_map['commission']}`")
+                            st.write(f"- Cột Sub_id1 (Tên tạm): `{col_map['sub1'] or 'Không tìm thấy'}`")
+                            st.write(f"- Cột Sub_id2 (Mã Zalo): `{col_map['sub2'] or 'Không tìm thấy'}`")
+                            
+                        order_id_col = col_map["order_id"]
+                        status_col = col_map["status"]
+                        commission_col = col_map["commission"]
+                        sub1_col = col_map["sub1"]
+                        sub2_col = col_map["sub2"]
+                        
+                        mapping_dict = dict(zip(
+                            df_mapping["Mã Zalo (Sub_id2)"].astype(str).str.strip(),
+                            df_mapping["Tên Khách Hàng"].astype(str).str.strip()
+                        ))
+                        
+                        existing_order_ids = set(df_data["Mã đơn"].astype(str).str.strip())
+                        
+                        valid_orders = []
+                        new_mappings_discovered = {}
+                        count_skipped_status = 0
+                        count_skipped_date = 0
+                        count_skipped_duplicate = 0
+                        
+                        for _, row in df_raw_csv.iterrows():
+                            status_val = str(row.get(status_col, "")).lower().strip()
+                            if any(bad in status_val for bad in ["hủy", "huy", "cancel", "bị hủy"]):
+                                count_skipped_status += 1
+                                continue
+                            if not any(good in status_val for good in ["chờ xử lý", "cho xu ly", "hoàn thành", "hoan thanh", "complete", "pending", "thành công"]):
+                                count_skipped_status += 1
+                                continue
+                                
+                            c_date = None
+                            if time_col_detected:
+                                c_date = parse_flexible_date(row.get(time_col_detected))
+                                
+                            if not daily_ignore_date:
+                                if not c_date:
+                                    count_skipped_date += 1
+                                    continue
+                                if not (daily_start_date <= c_date <= daily_end_date):
+                                    count_skipped_date += 1
+                                    continue
+                                    
+                            code = str(row.get(order_id_col, "")).strip()
+                            if not code:
+                                continue
+                                
+                            comm = parse_commission_number(row.get(commission_col, 0))
+                            
+                            if code in existing_order_ids:
+                                count_skipped_duplicate += 1
+                                continue
+                                
+                            zalo_id = str(row.get(sub2_col, "")).strip() if sub2_col else ""
+                            sub1_val = str(row.get(sub1_col, "")).strip() if sub1_col else ""
+                            
+                            if zalo_id and (zalo_id in mapping_dict) and mapping_dict[zalo_id]:
+                                customer_assigned_name = mapping_dict[zalo_id]
+                                customer_type_label = "Khách cũ"
+                            else:
+                                temp_name = sub1_val if sub1_val else (zalo_id if zalo_id else "Khách mới")
+                                customer_assigned_name = temp_name
+                                customer_type_label = "Khách mới (Tên tạm)"
+                                if zalo_id:
+                                    new_mappings_discovered[zalo_id] = temp_name
+                                    mapping_dict[zalo_id] = temp_name
+                                    
+                            order_date_str = c_date.strftime("%d/%m/%Y") if c_date else datetime.date.today().strftime("%d/%m/%Y")
+                            
+                            valid_orders.append({
+                                "Mã đơn": code,
+                                "Tên khách": customer_assigned_name,
+                                "Loại khách": customer_type_label,
+                                "Mã Zalo (Sub_id2)": zalo_id if zalo_id else "(Không có)",
+                                "Ngày đặt": order_date_str,
+                                "Tổng HH thực tế": comm,
+                                "Trạng thái": daily_import_status
+                            })
+                            
+                        if valid_orders:
+                            df_valid = pd.DataFrame(valid_orders)
+                            df_grouped = df_valid.groupby("Mã đơn", as_index=False).agg({
+                                "Tên khách": "first",
+                                "Loại khách": "first",
+                                "Mã Zalo (Sub_id2)": "first",
+                                "Ngày đặt": "first",
+                                "Tổng HH thực tế": "sum",
+                                "Trạng thái": "first"
+                            })
+                        else:
+                            df_grouped = pd.DataFrame()
+                            
+                        st.divider()
+                        st.markdown("#### 📊 Kết Quả Lọc Đơn Hàng")
+                        
+                        total_valid_count = len(df_grouped)
+                        total_valid_comm = int(df_grouped["Tổng HH thực tế"].sum()) if total_valid_count > 0 else 0
+                        count_new_cust = len(new_mappings_discovered)
+                        count_old_orders = len(df_grouped[df_grouped["Loại khách"] == "Khách cũ"]) if total_valid_count > 0 else 0
+                        
+                        st.markdown(f"""
+                        <div class="metrics-container">
+                            <div class="metric-card success">
+                                <div class="metric-title">📦 Đơn Hợp Lệ Sẵn Sàng Nạp</div>
+                                <div class="metric-amount">{total_valid_count} đơn</div>
+                                <div class="metric-count">Đã gộp theo mã đơn duy nhất</div>
+                            </div>
+                            <div class="metric-card warning">
+                                <div class="metric-title">💰 Tổng Hoa Hồng Đơn Hàng</div>
+                                <div class="metric-amount">{format_vnd(total_valid_comm)}</div>
+                                <div class="metric-count">Hoa hồng đơn hàng mới</div>
+                            </div>
+                            <div class="metric-card info">
+                                <div class="metric-title">👤 Đơn Khách Cũ (Đã Khớp Tên)</div>
+                                <div class="metric-amount">{count_old_orders} đơn</div>
+                                <div class="metric-count">Khớp mã Zalo từ Mapping_Data</div>
+                            </div>
+                            <div class="metric-card pending">
+                                <div class="metric-title">🆕 Khách Hàng Mới Phát Hiện</div>
+                                <div class="metric-amount">{count_new_cust} khách</div>
+                                <div class="metric-count">Sẽ tự thêm vào bảng Mapping</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        filter_notes = []
+                        if count_skipped_status > 0:
+                            filter_notes.append(f"Đã bỏ qua **{count_skipped_status}** dòng đơn bị hủy")
+                        if count_skipped_date > 0:
+                            filter_notes.append(f"Đã bỏ qua **{count_skipped_date}** dòng ngoài khoảng ngày")
+                        if count_skipped_duplicate > 0:
+                            filter_notes.append(f"Đã bỏ qua **{count_skipped_duplicate}** đơn đã có trong hệ thống (chống trùng)")
+                        if filter_notes:
+                            st.info("ℹ️ " + " | ".join(filter_notes))
+                            
+                        if total_valid_count > 0:
+                            if new_mappings_discovered:
+                                with st.expander(f"🆕 Danh sách {len(new_mappings_discovered)} khách hàng mới sẽ tự thêm vào Mapping_Data:", expanded=True):
+                                    df_new_cust_preview = pd.DataFrame([
+                                        {"Mã Zalo (Sub_id2)": z, "Tên tạm gán (Sub_id1)": n}
+                                        for z, n in new_mappings_discovered.items()
+                                    ])
+                                    st.dataframe(df_new_cust_preview, hide_index=True, use_container_width=True)
+                                    st.caption("💡 *Sau khi nạp, bạn có thể chuyển sang **Phần 5: Quản Lý Khách Hàng** để đổi tên chính xác và đồng bộ hàng loạt.*")
+                                    
+                            st.markdown("##### 📋 Xem trước danh sách đơn hàng sẽ nạp vào hệ thống:")
+                            st.dataframe(
+                                df_grouped,
+                                hide_index=True,
+                                use_container_width=True,
+                                column_config={
+                                    "Mã đơn": st.column_config.TextColumn("Mã đơn", width="medium"),
+                                    "Tên khách": st.column_config.TextColumn("Tên khách ghi nhận", width="medium"),
+                                    "Loại khách": st.column_config.TextColumn("Loại khách", width="small"),
+                                    "Mã Zalo (Sub_id2)": st.column_config.TextColumn("Mã Zalo", width="small"),
+                                    "Ngày đặt": st.column_config.TextColumn("Ngày đặt", width="small"),
+                                    "Tổng HH thực tế": st.column_config.NumberColumn("Hoa hồng thực tế", format="%,d ₫", width="medium"),
+                                    "Trạng thái": st.column_config.TextColumn("Trạng thái", width="small")
+                                }
+                            )
+                            
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            col_confirm, _ = st.columns([3, 7])
+                            with col_confirm:
+                                confirm_daily_import_btn = st.button("🚀 XÁC NHẬN NẠP VÀO HỆ THỐNG", use_container_width=True, type="primary")
+                                
+                            if confirm_daily_import_btn:
+                                with st.spinner("Đang đồng bộ dữ liệu lên Google Sheets..."):
+                                    if new_mappings_discovered:
+                                        batch_add_mapping_records(new_mappings_discovered, sheet_target=st.session_state["sheet_name"])
+                                        
+                                    orders_to_add = []
+                                    for _, r in df_grouped.iterrows():
+                                        orders_to_add.append({
+                                            "Tên khách": r["Tên khách"],
+                                            "Ngày đặt": r["Ngày đặt"],
+                                            "Mã đơn": r["Mã đơn"],
+                                            "Tổng HH thực tế": int(r["Tổng HH thực tế"]),
+                                            "Trạng thái": r["Trạng thái"]
+                                        })
+                                    batch_add_orders_to_storage(orders_to_add, sheet_target=st.session_state["sheet_name"])
+                                    
+                                st.toast(f"Đã nạp thành công {total_valid_count} đơn hàng vào hệ thống!", icon="🎉")
+                                st.success(f"🎉 Hoàn tất nạp đơn! Đã nạp thành công **{total_valid_count}** đơn hàng ({format_vnd(total_valid_comm)}) vào `Shopee_Cashback` và cập nhật **{count_new_cust}** khách hàng mới vào `Mapping_Data`!")
+                                st.rerun()
+                        else:
+                            st.warning("⚠️ Không tìm thấy đơn hàng nào hợp lệ để nạp!")
+
+        # ---------------------------------------------------------------------
+        # TAB 3: PHẦN 3 - ĐỐI SOÁT HOA HỒNG (CUỐI KỲ)
+        # ---------------------------------------------------------------------
+        with tab3:
+            st.markdown("##### 💰 Phần 3: Đối Soát Hoa Hồng Cuối Kỳ (Shopee Affiliate)")
+            st.caption("💡 *Quy trình nghiêm ngặt: Bỏ qua thời gian đặt hàng & click, chỉ lọc đơn 'Hoàn thành' theo ngày hoàn thành (đã cắt bỏ giờ/phút/giây), tính Thực nhận = (Hoa hồng ròng * 0.9) * 0.6, gom nhóm theo Sub_id2 và cập nhật đồng bộ.*")
+            
+            # 1. GIAO DIỆN (UI):
+            # 1.1. Tạo 2 ô chọn ngày (Date Picker): start_date và end_date
+            st.markdown("###### 🗓️ 1. Chọn Khoảng Ngày Đối Soát (Thời Gian Hoàn Thành):")
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                default_start = datetime.date.today().replace(day=1)
+                start_date = st.date_input("Từ ngày (start_date):", value=default_start, format="DD/MM/YYYY", key="rec_start_date")
+            with col_d2:
+                end_date = st.date_input("Đến ngày (end_date):", value=datetime.date.today(), format="DD/MM/YYYY", key="rec_end_date")
+                
+            # 1.2. Tạo 1 ô Upload File để tải lên file báo cáo .csv
+            st.markdown("###### 📁 2. Tải Lên File Báo Cáo Shopee (.csv):")
+            uploaded_file = st.file_uploader(
+                "Chọn file .csv báo cáo từ Shopee Affiliate:",
+                type=["csv"],
+                help="Tải lên file báo cáo chuyển đổi Shopee (chứa dữ liệu 30-45 ngày)",
+                key="rec_csv_uploader"
+            )
+            
+            # 1.3. Tạo 1 nút bấm 'Bắt đầu đối soát'
+            st.markdown("<br>", unsafe_allow_html=True)
+            col_btn, _ = st.columns([3, 7])
+            with col_btn:
+                btn_start_rec = st.button("🚀 Bắt đầu đối soát", use_container_width=True, type="primary")
+                
+            # XỬ LÝ KHI BẤM 'BẮT ĐẦU ĐỐI SOÁT'
+            if btn_start_rec:
+                if uploaded_file is None:
+                    st.error("⚠️ Vui lòng tải lên file báo cáo .csv trước khi bấm 'Bắt đầu đối soát'!")
+                elif start_date > end_date:
+                    st.error("⚠️ Khoảng ngày không hợp lệ! 'Từ ngày' phải nhỏ hơn hoặc bằng 'Đến ngày'.")
+                else:
+                    # Đọc file CSV
+                    raw_bytes = uploaded_file.getvalue()
+                    df_raw = None
+                    for enc in ["utf-8-sig", "utf-8", "cp1258", "latin-1"]:
+                        try:
+                            df_raw = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc, dtype=str)
+                            break
+                        except Exception:
+                            continue
+                            
+                    if df_raw is None or df_raw.empty:
+                        st.error("❌ Không thể đọc nội dung file CSV. Vui lòng kiểm tra lại định dạng file!")
+                    else:
+                        # Nhận diện cột theo quy tắc nghiêm ngặt
+                        col_status = None
+                        col_complete = None
+                        col_comm = None
+                        col_sub2 = None
+                        col_sub1 = None
+                        
+                        for col in df_raw.columns:
+                            c_clean = str(col).strip()
+                            c_low = c_clean.lower()
+                            if col_status is None and ("trạng thái đặt hàng" in c_low or "trạng thái đơn" in c_low or "order status" in c_low or c_low == "trạng thái"):
+                                col_status = c_clean
+                            if col_complete is None and ("thời gian hoàn thành" in c_low or "complete time" in c_low or "completed time" in c_low):
+                                col_complete = c_clean
+                            if col_comm is None and ("hoa hồng ròng tiếp thị liên kết" in c_low or "hoa hồng ròng" in c_low or "net commission" in c_low or "tổng hoa hồng sản phẩm" in c_low):
+                                if not any(bad in c_low for bad in ["loại", "tỷ lệ", "phí"]):
+                                    col_comm = c_clean
+                            if col_sub2 is None and ("sub_id2" in c_low or "sub id 2" in c_low or "sub2" in c_low or "mã zalo" in c_low):
+                                col_sub2 = c_clean
+                            if col_sub1 is None and ("sub_id1" in c_low or "sub id 1" in c_low or "sub1" in c_low or "tên tạm" in c_low):
+                                col_sub1 = c_clean
+                                
+                        # Kiểm tra các cột bắt buộc
+                        missing_cols = []
+                        if not col_status: missing_cols.append("Trạng thái đặt hàng")
+                        if not col_complete: missing_cols.append("Thời gian hoàn thành")
+                        if not col_comm: missing_cols.append("Hoa hồng ròng tiếp thị liên kết(₫)")
+                        if not col_sub2: missing_cols.append("Sub_id2 (Mã Zalo)")
+                        
+                        if missing_cols:
+                            st.error(f"⚠️ File CSV thiếu các cột bắt buộc: **{', '.join(missing_cols)}**. Vui lòng kiểm tra lại cấu trúc file xuất từ Shopee!")
+                            st.write("Các cột hiện có trong file CSV:", list(df_raw.columns))
+                        else:
+                            # 2. LOGIC LỌC NGÀY THÁNG (PANDAS):
+                            # Bước 1: Bỏ qua hoàn toàn cột Thời Gian Đặt Hàng và Thời gian Click.
+                            # Bước 2: Chỉ lọc lấy những dòng có Trạng thái đặt hàng == 'Hoàn thành'
+                            mask_status = df_raw[col_status].astype(str).str.strip().str.lower() == "hoàn thành"
+                            df_step2 = df_raw[mask_status].copy()
+                            
+                            total_completed_all_dates = len(df_step2)
+                            if total_completed_all_dates == 0:
+                                st.warning("⚠️ Không tìm thấy đơn hàng nào có Trạng thái đặt hàng là 'Hoàn thành' trong file CSV!")
+                            else:
+                                # Bước 3 (Quan trọng nhất): Ép kiểu dữ liệu của cột Thời gian hoàn thành sang DateTime, sau đó cắt bỏ phần giờ/phút/giây, chỉ giữ lại phần Ngày (Date)
+                                s_time = df_step2[col_complete].astype(str).str.strip()
+                                df_step2["complete_date"] = pd.to_datetime(s_time, errors="coerce").dt.date
+                                nat_mask = df_step2["complete_date"].isna() & (s_time != "") & (s_time != "nan")
+                                if nat_mask.any():
+                                    fallback_dt = pd.to_datetime(s_time[nat_mask], errors="coerce", format="mixed").dt.date
+                                    df_step2.loc[nat_mask, "complete_date"] = fallback_dt
+                                    
+                                # Bước 4: Áp dụng bộ lọc mask: complete_date >= start_date VÀ complete_date <= end_date
+                                mask_date = (df_step2["complete_date"] >= start_date) & (df_step2["complete_date"] <= end_date)
+                                df_filtered = df_step2[mask_date].copy()
+                                
+                                total_matched_orders = len(df_filtered)
+                                if total_matched_orders == 0:
+                                    st.warning(f"⚠️ Có {total_completed_all_dates} đơn 'Hoàn thành' trong file, nhưng **không có đơn nào** có Thời gian hoàn thành nằm trong khoảng từ **{start_date.strftime('%d/%m/%Y')}** đến **{end_date.strftime('%d/%m/%Y')}**!")
+                                else:
+                                    # 3. LOGIC TÍNH TOÁN TIỀN (CÔNG THỨC):
+                                    # Thực nhận = (Hoa hồng ròng tiếp thị liên kết(₫) * 0.9) * 0.6
+                                    raw_comm = df_filtered[col_comm].astype(str)\
+                                        .str.replace("₫", "", regex=False)\
+                                        .str.replace("VND", "", regex=False)\
+                                        .str.replace("VNĐ", "", regex=False)\
+                                        .str.replace(" ", "", regex=False)\
+                                        .str.strip()
+                                        
+                                    def parse_comm_to_float(v):
+                                        if not v or v == "nan": return 0.0
+                                        if "," in v and "." in v:
+                                            v = v.replace(",", "")
+                                        elif "," in v:
+                                            parts = v.split(",")
+                                            if len(parts) == 2 and len(parts[1]) != 3:
+                                                v = v.replace(",", ".")
+                                            else:
+                                                v = v.replace(",", "")
+                                        try:
+                                            return float(v)
+                                        except Exception:
+                                            return 0.0
+                                            
+                                    comm_numeric = raw_comm.apply(parse_comm_to_float)
+                                    df_filtered["Thực nhận"] = ((comm_numeric * 0.9) * 0.6).round().astype(int)
+                                    
+                                    # Làm sạch Sub_id2 & Sub_id1
+                                    df_filtered[col_sub2] = df_filtered[col_sub2].fillna("").astype(str).str.strip()
+                                    df_filtered.loc[df_filtered[col_sub2] == "", col_sub2] = "(Không có Sub_id2)"
+                                    
+                                    if col_sub1 and col_sub1 in df_filtered.columns:
+                                        df_filtered[col_sub1] = df_filtered[col_sub1].fillna("").astype(str).str.strip()
+                                    else:
+                                        df_filtered["_sub1_tmp"] = ""
+                                        col_sub1 = "_sub1_tmp"
+                                        
+                                    # Gom nhóm (Group by) dữ liệu theo cột Sub_id2 (Mã Zalo) và tính tổng tiền "Thực nhận" cho từng mã
+                                    df_grouped = df_filtered.groupby(col_sub2, as_index=False).agg(
+                                        Tong_Thuc_Nhan=("Thực nhận", "sum"),
+                                        Sub_id1=(col_sub1, "first"),
+                                        So_Don=("Thực nhận", "count")
+                                    )
+                                    
+                                    # 4. LOGIC MAPPING VÀ CẬP NHẬT LÊN GOOGLE SHEETS:
+                                    with st.spinner("Đang đối chiếu Mapping và cập nhật lên Google Sheets & CSV..."):
+                                        df_mapping_curr, _, _ = load_mapping_data(st.session_state["sheet_name"])
+                                        df_orders_curr, _, _ = load_data(st.session_state["sheet_name"])
+                                        
+                                        mapping_dict = dict(zip(
+                                            df_mapping_curr["Mã Zalo (Sub_id2)"].astype(str).str.strip(),
+                                            df_mapping_curr["Tên Khách Hàng"].astype(str).str.strip()
+                                        ))
+                                        
+                                        new_mapping_rows = []
+                                        reconcile_results = []
+                                        count_old_updated = 0
+                                        count_new_added = 0
+                                        
+                                        for _, r in df_grouped.iterrows():
+                                            zalo_code = str(r[col_sub2]).strip()
+                                            thuc_nhan_val = int(r["Tong_Thuc_Nhan"])
+                                            sub1_code = str(r["Sub_id1"]).strip()
+                                            don_count = int(r["So_Don"])
+                                            
+                                            if zalo_code in mapping_dict and mapping_dict[zalo_code]:
+                                                # Khách Cũ (Sub_id2 ĐÃ CÓ trong Mapping_Data):
+                                                # Lấy "Tên Khách Hàng" tương ứng, sau đó chạy sang sheet Shopee_Cashback cập nhật số tiền Thực nhận vào dòng của khách đó
+                                                matched_name = mapping_dict[zalo_code]
+                                                cust_type_label = "Khách Cũ"
+                                                count_old_updated += 1
+                                                
+                                                mask_c = (df_orders_curr["Tên khách"] == matched_name)
+                                                mask_p = mask_c & (df_orders_curr["Trạng thái"].isin(["Chờ Shopee duyệt", "Chờ Bank"]))
+                                                
+                                                if mask_p.any():
+                                                    idx_target = df_orders_curr[mask_p].index[-1]
+                                                    df_orders_curr.at[idx_target, "Tổng HH thực tế"] = thuc_nhan_val
+                                                    df_orders_curr.at[idx_target, "Trạng thái"] = "Chờ Bank"
+                                                    df_orders_curr.at[idx_target, "Ngày đặt"] = end_date.strftime("%d/%m/%Y")
+                                                    action_msg = f"Đã cập nhật dòng đơn chờ sang 'Chờ Bank' ({format_vnd(thuc_nhan_val)})"
+                                                else:
+                                                    new_rec = {
+                                                        "Tên khách": matched_name,
+                                                        "Ngày đặt": end_date.strftime("%d/%m/%Y"),
+                                                        "Mã đơn": f"ĐS_{start_date.strftime('%d%m')}_{end_date.strftime('%d%m')}",
+                                                        "Tổng HH thực tế": thuc_nhan_val,
+                                                        "Trạng thái": "Chờ Bank"
+                                                    }
+                                                    df_orders_curr = pd.concat([df_orders_curr, pd.DataFrame([new_rec])], ignore_index=True)
+                                                    action_msg = f"Đã ghi thêm dòng đối soát 'Chờ Bank' ({format_vnd(thuc_nhan_val)})"
+                                            else:
+                                                # Khách Mới (Sub_id2 CHƯA CÓ trong Mapping_Data):
+                                                # Lấy dữ liệu ở cột Sub_id1 (ví dụ: HuongRosy) trong file CSV làm tên tạm
+                                                temp_cust_name = sub1_code if sub1_code else (zalo_code if zalo_code else "Khách mới")
+                                                cust_type_label = "Khách Mới (Tên tạm)"
+                                                count_new_added += 1
+                                                
+                                                # Ghi thêm 1 dòng mới vào Mapping_Data gồm: Mã Sub_id2 mới + Tên tạm
+                                                if zalo_code and zalo_code != "(Không có Sub_id2)":
+                                                    new_mapping_rows.append({
+                                                        "Mã Zalo (Sub_id2)": zalo_code,
+                                                        "Tên Khách Hàng": temp_cust_name
+                                                    })
+                                                    mapping_dict[zalo_code] = temp_cust_name
+                                                    
+                                                # Ghi thêm 1 dòng mới vào Shopee_Cashback gồm: Tên tạm + Số tiền Thực nhận + Trạng thái "Chờ Bank"
+                                                new_rec = {
+                                                    "Tên khách": temp_cust_name,
+                                                    "Ngày đặt": end_date.strftime("%d/%m/%Y"),
+                                                    "Mã đơn": f"ĐS_{start_date.strftime('%d%m')}_{end_date.strftime('%d%m')}",
+                                                    "Tổng HH thực tế": thuc_nhan_val,
+                                                    "Trạng thái": "Chờ Bank"
+                                                }
+                                                df_orders_curr = pd.concat([df_orders_curr, pd.DataFrame([new_rec])], ignore_index=True)
+                                                matched_name = temp_cust_name
+                                                action_msg = f"Đã thêm vào Mapping & tạo dòng 'Chờ Bank' ({format_vnd(thuc_nhan_val)})"
+                                                
+                                            reconcile_results.append({
+                                                "Mã Zalo (Sub_id2)": zalo_code,
+                                                "Tên Khách Hàng": matched_name,
+                                                "Loại khách": cust_type_label,
+                                                "Số đơn hoàn thành": don_count,
+                                                "Thực nhận (VNĐ)": thuc_nhan_val,
+                                                "Trạng thái": "Chờ Bank",
+                                                "Thao tác": action_msg
+                                            })
+                                            
+                                        # Lưu bảng Mapping_Data nếu có khách mới
+                                        if new_mapping_rows:
+                                            df_new_map_batch = pd.DataFrame(new_mapping_rows)
+                                            updated_mapping_all = pd.concat([df_mapping_curr, df_new_map_batch], ignore_index=True)
+                                            save_mapping_data(updated_mapping_all, sheet_target=st.session_state["sheet_name"])
+                                            
+                                        # Lưu bảng Shopee_Cashback
+                                        save_all_to_storage(df_orders_curr, sheet_target=st.session_state["sheet_name"])
+                                        
+                                    total_thuc_nhan_sum = sum(r["Thực nhận (VNĐ)"] for r in reconcile_results)
+                                    
+                                    st.toast("Đối soát và cập nhật Google Sheets thành công!", icon="🎉")
+                                    st.success(f"🎉 **ĐỐI SOÁT THÀNH CÔNG!** Đã xử lý **{total_matched_orders}** đơn hoàn thành từ **{start_date.strftime('%d/%m/%Y')}** đến **{end_date.strftime('%d/%m/%Y')}** cho **{len(reconcile_results)}** mã khách hàng. Tổng tiền Thực nhận: **{format_vnd(total_thuc_nhan_sum)}**.")
+                                    
+                                    # Hiển thị số liệu tổng quan
+                                    st.markdown(f"""
+                                    <div class="metrics-container">
+                                        <div class="metric-card success">
+                                            <div class="metric-title">💰 Tổng Tiền Thực Nhận (60%)</div>
+                                            <div class="metric-amount">{format_vnd(total_thuc_nhan_sum)}</div>
+                                            <div class="metric-count">Công thức: (Hoa hồng ròng * 0.9) * 0.6</div>
+                                        </div>
+                                        <div class="metric-card info">
+                                            <div class="metric-title">📦 Đơn Hoàn Thành Đã Lọc</div>
+                                            <div class="metric-amount">{total_matched_orders} đơn</div>
+                                            <div class="metric-count">Từ {start_date.strftime('%d/%m/%Y')} đến {end_date.strftime('%d/%m/%Y')}</div>
+                                        </div>
+                                        <div class="metric-card pending">
+                                            <div class="metric-title">👤 Khách Cũ Đã Cập Nhật</div>
+                                            <div class="metric-amount">{count_old_updated} khách</div>
+                                            <div class="metric-count">Cập nhật vào Shopee_Cashback (Chờ Bank)</div>
+                                        </div>
+                                        <div class="metric-card warning">
+                                            <div class="metric-title">🆕 Khách Mới Phát Hiện</div>
+                                            <div class="metric-amount">{count_new_added} khách</div>
+                                            <div class="metric-count">Đã ghi vào Mapping & Shopee_Cashback</div>
+                                        </div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    
+                                    st.markdown("##### 📋 Bảng Chi Tiết Kết Quả Đối Soát Đã Cập Nhật:")
+                                    df_summary_table = pd.DataFrame(reconcile_results)
+                                    st.dataframe(
+                                        df_summary_table,
+                                        hide_index=True,
+                                        use_container_width=True,
+                                        column_config={
+                                            "Mã Zalo (Sub_id2)": st.column_config.TextColumn("Mã Zalo (Sub_id2)", width="medium"),
+                                            "Tên Khách Hàng": st.column_config.TextColumn("Tên Khách Hàng", width="medium"),
+                                            "Loại khách": st.column_config.TextColumn("Loại khách", width="small"),
+                                            "Số đơn hoàn thành": st.column_config.NumberColumn("Số đơn", width="small"),
+                                            "Thực nhận (VNĐ)": st.column_config.NumberColumn("Thực nhận (VNĐ)", format="%,d ₫", width="medium"),
+                                            "Trạng thái": st.column_config.TextColumn("Trạng thái", width="small"),
+                                            "Thao tác": st.column_config.TextColumn("Chi tiết hành động", width="large")
+                                        }
+                                    )
+
+        # ---------------------------------------------------------------------
+        # TAB 4: PHẦN 4 - CẬP NHẬT DỮ LIỆU HÀNG LOẠT (DATA EDITOR)
+        # ---------------------------------------------------------------------
+        with tab4:
+            st.markdown("##### 📊 Phần 4: Quản Lý & Chỉnh Sửa Dữ Liệu Hàng Loạt")
             st.caption("💡 *Chỉnh sửa trực tiếp trên bảng Data Editor bên dưới, sau đó bấm **LƯU THAY ĐỔI** để cập nhật lên Google Sheets.*")
             
             c_search, c_status = st.columns([3, 2])
@@ -879,6 +1799,157 @@ def main():
                     st.toast("Đã lưu vào CSV cục bộ!", icon="💾")
                     st.warning(f"✅ Dữ liệu đã lưu vào CSV cục bộ. (Google Sheets: {err})")
                 st.rerun()
+
+        # ---------------------------------------------------------------------
+        # TAB 5: QUẢN LÝ KHÁCH HÀNG & ĐỒNG BỘ TÊN (PHẦN 5)
+        # ---------------------------------------------------------------------
+        with tab5:
+            st.markdown("##### 👥 Quản Lý Khách Hàng & Đồng Bộ Tên Tự Động")
+            st.caption("💡 *Đọc dữ liệu từ bảng **Mapping_Data**. Khi bạn sửa tên khách hàng tại đây, hệ thống sẽ **tự động cập nhật vào bảng Mapping** và **quét sửa toàn bộ các đơn hàng cũ mang tên cũ trong Shopee_Cashback**.*")
+            
+            # Tính toán thống kê đơn hàng cho từng khách trong Mapping
+            customer_stats = {}
+            for _, r in df_data.iterrows():
+                c_name = str(r["Tên khách"]).strip()
+                c_amt = int(r["Tổng HH thực tế"])
+                if c_name not in customer_stats:
+                    customer_stats[c_name] = {"count": 0, "total": 0}
+                customer_stats[c_name]["count"] += 1
+                customer_stats[c_name]["total"] += c_amt
+                
+            # Tạo DataFrame Mapping có thêm cột thống kê
+            mapping_display_list = []
+            for _, r in df_mapping.iterrows():
+                zalo = str(r["Mã Zalo (Sub_id2)"]).strip()
+                name = str(r["Tên Khách Hàng"]).strip()
+                stats = customer_stats.get(name, {"count": 0, "total": 0})
+                mapping_display_list.append({
+                    "Mã Zalo (Sub_id2)": zalo,
+                    "Tên Khách Hàng": name,
+                    "Số đơn hàng": stats["count"],
+                    "Tổng tiền hoa hồng (VNĐ)": stats["total"]
+                })
+            df_mapping_stats = pd.DataFrame(mapping_display_list)
+            
+            # PHẦN A: CÔNG CỤ SỬA VÀ ĐỒNG BỘ TÊN NHANH
+            st.markdown("###### 🔄 Đổi Tên Chuẩn & Đồng Bộ Toàn Bộ Đơn Hàng Cũ:")
+            
+            if not df_mapping.empty:
+                # Tạo danh sách lựa chọn khách hàng
+                cust_options = []
+                for _, r in df_mapping.iterrows():
+                    z = str(r["Mã Zalo (Sub_id2)"]).strip()
+                    n = str(r["Tên Khách Hàng"]).strip()
+                    s = customer_stats.get(n, {"count": 0, "total": 0})
+                    cust_options.append(f"{n} (Zalo: {z}) - [{s['count']} đơn, {format_vnd(s['total'])}]")
+                    
+                selected_option = st.selectbox(
+                    "Chọn khách hàng cần chuẩn hóa tên:",
+                    options=cust_options,
+                    help="Chọn khách hàng từ bảng Mapping để đổi tên và đồng bộ đơn hàng"
+                )
+                
+                # Trích xuất Zalo và Tên hiện tại từ option đã chọn
+                idx_sel = cust_options.index(selected_option)
+                selected_zalo = df_mapping.iloc[idx_sel]["Mã Zalo (Sub_id2)"]
+                current_selected_name = df_mapping.iloc[idx_sel]["Tên Khách Hàng"]
+                curr_orders_count = customer_stats.get(current_selected_name, {"count": 0})["count"]
+                
+                col_rename1, col_rename2, col_rename3 = st.columns([3, 3, 2])
+                with col_rename1:
+                    st.text_input("Tên hiện tại trong hệ thống:", value=current_selected_name, disabled=True)
+                with col_rename2:
+                    new_correct_name = st.text_input("Nhập tên chuẩn mới:", placeholder="Ví dụ: Hương Rosy, Nguyễn Văn A...", key="input_new_cust_name")
+                with col_rename3:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    sync_name_btn = st.button("🔄 LƯU & ĐỒNG BỘ", use_container_width=True)
+                    
+                if sync_name_btn:
+                    if not new_correct_name.strip():
+                        st.error("⚠️ Vui lòng nhập tên chuẩn mới!")
+                    elif new_correct_name.strip() == current_selected_name.strip():
+                        st.warning("⚠️ Tên mới trùng với tên cũ. Không có thay đổi nào được thực hiện.")
+                    else:
+                        with st.spinner("Đang đồng bộ tên trên Mapping_Data và Shopee_Cashback..."):
+                            ok, num_synced, err = sync_customer_name(
+                                old_name=current_selected_name,
+                                new_name=new_correct_name,
+                                target_sub2=selected_zalo,
+                                sheet_target=st.session_state["sheet_name"]
+                            )
+                        if ok:
+                            st.toast(f"Đã đổi '{current_selected_name}' -> '{new_correct_name}' và đồng bộ {num_synced} đơn hàng!", icon="✨")
+                            st.success(f"🎉 **Thành công!** Đã đổi tên thành công trong bảng `Mapping_Data` và tự động cập nhật **{num_synced}** đơn hàng cũ trong bảng `Shopee_Cashback` sang tên mới **'{new_correct_name}'**!")
+                            st.rerun()
+                        else:
+                            st.error(f"Lỗi khi đồng bộ tên: {err}")
+            else:
+                st.info("Bảng Mapping hiện chưa có dữ liệu. Bạn có thể thêm khách mới bên dưới hoặc Import từ file CSV Shopee.")
+                
+            st.divider()
+            
+            # PHẦN B: BẢNG DỮ LIỆU MAPPING & CHỈNH SỬA TRỰC TIẾP
+            st.markdown("###### 📋 Bảng Dữ Liệu Mapping Khách Hàng (Mã Zalo ↔ Tên Chuẩn):")
+            st.caption("💡 *Bạn cũng có thể sửa trực tiếp trên bảng dưới đây hoặc thêm khách mới, sau đó nhấn **LƯU BẢNG MAPPING**.*")
+            
+            edited_mapping_table = st.data_editor(
+                df_mapping_stats if not df_mapping_stats.empty else pd.DataFrame(columns=["Mã Zalo (Sub_id2)", "Tên Khách Hàng", "Số đơn hàng", "Tổng tiền hoa hồng (VNĐ)"]),
+                hide_index=True,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "Mã Zalo (Sub_id2)": st.column_config.TextColumn("Mã Zalo (Sub_id2)", required=True, width="medium"),
+                    "Tên Khách Hàng": st.column_config.TextColumn("Tên Khách Hàng Chuẩn", required=True, width="medium"),
+                    "Số đơn hàng": st.column_config.NumberColumn("Số đơn hiện có", disabled=True, width="small"),
+                    "Tổng tiền hoa hồng (VNĐ)": st.column_config.NumberColumn("Tổng tiền tích lũy", format="%,d ₫", disabled=True, width="medium")
+                },
+                key="mapping_data_editor"
+            )
+            
+            col_save_map, _ = st.columns([3, 7])
+            with col_save_map:
+                save_mapping_btn = st.button("💾 LƯU BẢNG MAPPING & ĐỒNG BỘ", use_container_width=True)
+                
+            if save_mapping_btn:
+                # Kiểm tra các thay đổi tên để đồng bộ sang Shopee_Cashback
+                df_edited_clean = edited_mapping_table[["Mã Zalo (Sub_id2)", "Tên Khách Hàng"]].copy()
+                
+                # So sánh tên cũ và mới
+                old_map_dict = dict(zip(df_mapping["Mã Zalo (Sub_id2)"].astype(str).str.strip(), df_mapping["Tên Khách Hàng"].astype(str).str.strip()))
+                synced_total_orders = 0
+                
+                with st.spinner("Đang lưu bảng Mapping và quét đồng bộ đơn hàng..."):
+                    for _, r in df_edited_clean.iterrows():
+                        z = str(r["Mã Zalo (Sub_id2)"]).strip()
+                        new_n = str(r["Tên Khách Hàng"]).strip()
+                        if z in old_map_dict:
+                            old_n = old_map_dict[z]
+                            if old_n and new_n and (old_n != new_n):
+                                _, n_synced, _ = sync_customer_name(old_n, new_n, target_sub2=z, sheet_target=st.session_state["sheet_name"])
+                                synced_total_orders += n_synced
+                                
+                    save_mapping_data(df_edited_clean, sheet_target=st.session_state["sheet_name"])
+                    
+                st.toast("Đã lưu bảng Mapping và đồng bộ thành công!", icon="💾")
+                st.success(f"✅ Bảng `Mapping_Data` đã được cập nhật thành công! (Đã quét đồng bộ {synced_total_orders} đơn hàng trong `Shopee_Cashback`).")
+                st.rerun()
+
+            st.divider()
+            # PHẦN C: ĐỒNG BỘ KHI SỬA TRỰC TIẾP TRÊN GOOGLE SHEETS
+            st.markdown("###### ⚡ Đồng Bộ Khi Chỉnh Sửa Trên Google Sheets:")
+            st.caption("💡 *Nếu bạn vừa gõ sửa tên trực tiếp trên website Google Sheets (ở sheet `Mapping_Data`), bấm nút dưới đây để hệ thống tự động quét và cập nhật toàn bộ đơn hàng trong `Shopee_Cashback` theo tên chuẩn mới.*")
+            col_auto_sync, _ = st.columns([4, 6])
+            with col_auto_sync:
+                auto_sync_btn = st.button("⚡ QUÉT & ĐỒNG BỘ TÊN TỪ GOOGLE SHEETS SANG ĐƠN HÀNG", use_container_width=True)
+            if auto_sync_btn:
+                with st.spinner("Đang đối soát và đồng bộ đơn hàng theo bảng Mapping..."):
+                    cnt_updated, list_changes = auto_sync_names_from_mapping(sheet_target=st.session_state["sheet_name"])
+                if cnt_updated > 0:
+                    st.toast(f"Đã cập nhật {cnt_updated} đơn hàng!", icon="✨")
+                    st.success(f"🎉 Đã quét và cập nhật thành công **{cnt_updated}** đơn hàng theo tên chuẩn trong `Mapping_Data`: {', '.join(list_changes)}")
+                    st.rerun()
+                else:
+                    st.info("✅ Toàn bộ đơn hàng trong `Shopee_Cashback` hiện tại đã khớp 100% với tên chuẩn trong `Mapping_Data`!")
 
 if __name__ == "__main__":
     main()
